@@ -97,12 +97,14 @@ impl Server {
         >,
     ) -> anyhow::Result<Arc<Self>> {
         let shells = Arc::new(Mutex::new(HashMap::new()));
+        let events_bus = events::EventBus::new();
         // buffered so that we are unlikely to block when setting up a
         // new session
         let (new_sess_tx, new_sess_rx) = crossbeam_channel::bounded(10);
         let shells_tab = Arc::clone(&shells);
+        let reaper_bus = Arc::clone(&events_bus);
         thread::spawn(move || {
-            if let Err(e) = ttl_reaper::run(new_sess_rx, shells_tab) {
+            if let Err(e) = ttl_reaper::run(new_sess_rx, shells_tab, reaper_bus) {
                 warn!("ttl reaper exited with error: {:?}", e);
             }
         });
@@ -114,7 +116,7 @@ impl Server {
             runtime_dir,
             register_new_reapable_session: new_sess_tx,
             hooks,
-            events_bus: events::EventBus::new(),
+            events_bus,
             daily_messenger,
             log_level_handle,
             vars: HashMap::new().into(),
@@ -362,6 +364,10 @@ impl Server {
                     let _s = span!(Level::INFO, "2_lock(shells)").entered();
                     let mut shells = self.shells.lock();
                     shells.remove(&header.name);
+                    self.events_bus.publish(&events::Event::SessionRemoved {
+                        name: header.name.clone(),
+                        reason: events::RemovedReason::Exited,
+                    });
                 }
 
                 // The child shell has exited, so the shell->client thread should
@@ -380,8 +386,12 @@ impl Server {
                     let _s = span!(Level::INFO, "disconnect_lock(shells)").entered();
                     let shells = self.shells.lock();
                     if let Some(session) = shells.get(&header.name) {
-                        session.lifecycle_timestamps.lock().last_disconnected_at =
-                            Some(time::SystemTime::now());
+                        let now = time::SystemTime::now();
+                        session.lifecycle_timestamps.lock().last_disconnected_at = Some(now);
+                        self.events_bus.publish(&events::Event::SessionDetached {
+                            name: header.name.clone(),
+                            last_disconnected_at_unix_ms: unix_ms(now),
+                        });
                     }
                 }
                 if let Err(err) = self.hooks.on_client_disconnect(&header.name) {
@@ -444,8 +454,12 @@ impl Server {
                             // the channel is still open so the subshell is still running
                             info!("taking over existing session inner");
                             inner.client_stream = Some(stream.try_clone()?);
-                            session.lifecycle_timestamps.lock().last_connected_at =
-                                Some(time::SystemTime::now());
+                            let now = time::SystemTime::now();
+                            session.lifecycle_timestamps.lock().last_connected_at = Some(now);
+                            self.events_bus.publish(&events::Event::SessionAttached {
+                                name: header.name.clone(),
+                                last_connected_at_unix_ms: unix_ms(now),
+                            });
 
                             if inner
                                 .shell_to_client_join_h
@@ -529,12 +543,21 @@ impl Server {
             matches!(motd, MotdDisplayMode::Dump),
         )?;
 
-        session.lifecycle_timestamps.lock().last_connected_at = Some(time::SystemTime::now());
+        let now = time::SystemTime::now();
+        session.lifecycle_timestamps.lock().last_connected_at = Some(now);
+        let started_at = session.started_at;
         {
-            // we unwrap to propagate the poison as an unwind
             let _s = span!(Level::INFO, "select_shell_lock_2(shells)").entered();
             let mut shells = self.shells.lock();
             shells.insert(header.name.clone(), Box::new(session));
+            self.events_bus.publish(&events::Event::SessionCreated {
+                name: header.name.clone(),
+                started_at_unix_ms: unix_ms(started_at),
+            });
+            self.events_bus.publish(&events::Event::SessionAttached {
+                name: header.name.clone(),
+                last_connected_at_unix_ms: unix_ms(now),
+            });
         }
 
         // we unwrap to propagate the poison as an unwind
@@ -632,8 +655,12 @@ impl Server {
                     if let shell::ClientConnectionStatus::DetachNone = status {
                         not_attached_sessions.push(session);
                     } else {
-                        s.lifecycle_timestamps.lock().last_disconnected_at =
-                            Some(time::SystemTime::now());
+                        let now = time::SystemTime::now();
+                        s.lifecycle_timestamps.lock().last_disconnected_at = Some(now);
+                        self.events_bus.publish(&events::Event::SessionDetached {
+                            name: session.clone(),
+                            last_disconnected_at_unix_ms: unix_ms(now),
+                        });
                     }
                 } else {
                     not_found_sessions.push(session);
@@ -742,6 +769,10 @@ impl Server {
 
             for session in to_remove.iter() {
                 shells.remove(session);
+                self.events_bus.publish(&events::Event::SessionRemoved {
+                    name: session.clone(),
+                    reason: events::RemovedReason::Killed,
+                });
             }
             if !to_remove.is_empty() {
                 test_hooks::emit("daemon-handle-kill-removed-shells");
@@ -1247,6 +1278,10 @@ impl Server {
     fn session_dir<P: AsRef<Path>>(&self, session_name: P) -> PathBuf {
         self.runtime_dir.join("sessions").join(session_name)
     }
+}
+
+fn unix_ms(t: time::SystemTime) -> i64 {
+    t.duration_since(time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 /// Collect a snapshot of the session table for `list` replies and event

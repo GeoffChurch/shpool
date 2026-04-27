@@ -31,12 +31,14 @@ use parking_lot::Mutex;
 use tracing::{info, span, warn, Level};
 
 use super::shell;
+use crate::events;
 
 /// Run the reaper thread loop. Should be invoked in a dedicated
 /// thread.
 pub fn run(
     new_sess: crossbeam_channel::Receiver<(String, Instant)>,
     shells: Arc<Mutex<HashMap<String, Box<shell::Session>>>>,
+    events_bus: Arc<events::EventBus>,
 ) -> anyhow::Result<()> {
     let _s = span!(Level::INFO, "ttl_reaper").entered();
 
@@ -116,6 +118,13 @@ pub fn run(
                         continue;
                     }
                     shells.remove(&reapable.session_name);
+                    // Reaping is a daemon-initiated termination; surfaced to
+                    // subscribers as `killed` until we have a use case for a
+                    // dedicated reason.
+                    events_bus.publish(&events::Event::SessionRemoved {
+                        name: reapable.session_name.clone(),
+                        reason: events::RemovedReason::Killed,
+                    });
                 }
             }
         }
