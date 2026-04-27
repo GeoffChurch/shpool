@@ -76,7 +76,7 @@ pub struct Server {
     runtime_dir: PathBuf,
     register_new_reapable_session: crossbeam_channel::Sender<(String, Instant)>,
     hooks: Box<dyn hooks::Hooks + Send + Sync>,
-    pub events_bus: Arc<events::EventBus>,
+    events_bus: Arc<events::EventBus>,
     daily_messenger: Arc<show_motd::DailyMessenger>,
     log_level_handle: tracing_subscriber::reload::Handle<
         tracing_subscriber::filter::LevelFilter,
@@ -132,9 +132,7 @@ impl Server {
         socket_path: PathBuf,
     ) -> anyhow::Result<events::ListenerGuard> {
         let server = Arc::clone(self);
-        events::start_listener(socket_path, move |stream| {
-            server.handle_events_subscriber(stream)
-        })
+        events::start_listener(socket_path, move |stream| server.handle_events_subscriber(stream))
     }
 
     fn handle_events_subscriber(&self, stream: UnixStream) -> anyhow::Result<()> {
@@ -363,11 +361,14 @@ impl Server {
                 {
                     let _s = span!(Level::INFO, "2_lock(shells)").entered();
                     let mut shells = self.shells.lock();
-                    shells.remove(&header.name);
-                    self.events_bus.publish(&events::Event::SessionRemoved {
-                        name: header.name.clone(),
-                        reason: events::RemovedReason::Exited,
-                    });
+                    // Gated: a concurrent kill or reaper may have already
+                    // removed the entry and published its own removal.
+                    if shells.remove(&header.name).is_some() {
+                        self.events_bus.publish(&events::Event::SessionRemoved {
+                            name: header.name.clone(),
+                            reason: events::RemovedReason::Exited,
+                        });
+                    }
                 }
 
                 // The child shell has exited, so the shell->client thread should
@@ -456,10 +457,6 @@ impl Server {
                             inner.client_stream = Some(stream.try_clone()?);
                             let now = time::SystemTime::now();
                             session.lifecycle_timestamps.lock().last_connected_at = Some(now);
-                            self.events_bus.publish(&events::Event::SessionAttached {
-                                name: header.name.clone(),
-                                last_connected_at_unix_ms: unix_ms(now),
-                            });
 
                             if inner
                                 .shell_to_client_join_h
@@ -471,6 +468,12 @@ impl Server {
                                     "child_exited chan unclosed, but shell->client thread has exited, clobbering with new subshell"
                                 );
                             } else {
+                                // Reattach confirmed; the create path won't run
+                                // and clobber the entry, so it's safe to publish.
+                                self.events_bus.publish(&events::Event::SessionAttached {
+                                    name: header.name.clone(),
+                                    last_connected_at_unix_ms: unix_ms(now),
+                                });
                                 if let Err(err) = self.hooks.on_reattach(&header.name) {
                                     warn!("reattach hook: {:?}", err);
                                 }
@@ -487,8 +490,6 @@ impl Server {
                                     AttachStatus::Attached { warnings },
                                 ));
                             }
-
-                            // status is already attached
                         }
                         Some(exit_status) => {
                             // the channel is closed so we know the subshell exited
@@ -549,7 +550,17 @@ impl Server {
         {
             let _s = span!(Level::INFO, "select_shell_lock_2(shells)").entered();
             let mut shells = self.shells.lock();
+            // If we're replacing a stale entry whose shell process is
+            // gone, surface that to subscribers before announcing the
+            // replacement.
+            let clobbered = shells.contains_key(&header.name);
             shells.insert(header.name.clone(), Box::new(session));
+            if clobbered {
+                self.events_bus.publish(&events::Event::SessionRemoved {
+                    name: header.name.clone(),
+                    reason: events::RemovedReason::Exited,
+                });
+            }
             self.events_bus.publish(&events::Event::SessionCreated {
                 name: header.name.clone(),
                 started_at_unix_ms: unix_ms(started_at),
@@ -655,12 +666,12 @@ impl Server {
                     if let shell::ClientConnectionStatus::DetachNone = status {
                         not_attached_sessions.push(session);
                     } else {
-                        let now = time::SystemTime::now();
-                        s.lifecycle_timestamps.lock().last_disconnected_at = Some(now);
-                        self.events_bus.publish(&events::Event::SessionDetached {
-                            name: session.clone(),
-                            last_disconnected_at_unix_ms: unix_ms(now),
-                        });
+                        // The bidi-loop unwind in handle_attach owns the
+                        // SessionDetached publish (with its own timestamp);
+                        // we just update last_disconnected_at eagerly so a
+                        // concurrent list() reflects the detach immediately.
+                        s.lifecycle_timestamps.lock().last_disconnected_at =
+                            Some(time::SystemTime::now());
                     }
                 } else {
                     not_found_sessions.push(session);
@@ -1287,9 +1298,7 @@ fn unix_ms(t: time::SystemTime) -> i64 {
 /// Collect a snapshot of the session table for `list` replies and event
 /// snapshots. The caller must hold the shells lock for the duration of
 /// the call so the resulting list is consistent with concurrent mutators.
-fn collect_sessions(
-    shells: &HashMap<String, Box<shell::Session>>,
-) -> anyhow::Result<Vec<Session>> {
+fn collect_sessions(shells: &HashMap<String, Box<shell::Session>>) -> anyhow::Result<Vec<Session>> {
     shells
         .iter()
         .map(|(k, v)| {
