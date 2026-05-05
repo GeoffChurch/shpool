@@ -309,4 +309,124 @@ mod tests {
         drop(guard);
         assert!(!path.exists(), "socket file should be unlinked on guard drop");
     }
+
+    #[test]
+    fn bus_publish_with_many_subscribers_is_not_quadratic() {
+        let bus = EventBus::new();
+        let n = 10_000;
+        let mut rxs = Vec::with_capacity(n);
+        for _ in 0..n {
+            rxs.push(bus.register());
+        }
+        let start = std::time::Instant::now();
+        bus.publish(&Event::SessionCreated);
+        let elapsed = start.elapsed();
+        // Measured ~4 ms on a 2.1 GHz CPU; the 50 ms bound absorbs CI
+        // tail latency while still catching gross regressions (e.g. an
+        // accidental O(N^2) would be on the order of seconds at N=10K).
+        assert!(elapsed < Duration::from_millis(50), "publish to {n} subscribers took {elapsed:?}");
+    }
+
+    #[test]
+    fn bus_drops_slow_subscriber_on_overflow_without_affecting_fast() {
+        // This test is O(SUBSCRIBER_QUEUE_DEPTH); cap the constant so a
+        // future bump (e.g. after moving to a dynamically-grown queue) doesn't make
+        // this test unboundedly slow.
+        assert!(SUBSCRIBER_QUEUE_DEPTH < 1024);
+
+        let bus = EventBus::new();
+        let slow_rx = bus.register();
+        let fast_rx = bus.register();
+
+        // Fill slow's queue while draining fast each iteration so only slow
+        // accumulates a backlog.
+        for _ in 0..SUBSCRIBER_QUEUE_DEPTH {
+            bus.publish(&Event::SessionCreated);
+            assert_eq!(&*fast_rx.recv().unwrap(), "{\"type\":\"session.created\"}\n");
+        }
+        assert_eq!(bus.subscribers.lock().unwrap().len(), 2);
+
+        // The next publish overflows slow's queue and drops it. Fast's queue
+        // is empty so it keeps receiving.
+        bus.publish(&Event::SessionCreated);
+        assert_eq!(&*fast_rx.recv().unwrap(), "{\"type\":\"session.created\"}\n");
+        assert_eq!(bus.subscribers.lock().unwrap().len(), 1);
+
+        drop(slow_rx);
+    }
+
+    #[test]
+    fn accept_loop_registers_concurrent_subscribers() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.socket");
+        let bus = EventBus::new();
+        let _guard = start_listener(path.clone(), Arc::clone(&bus)).unwrap();
+
+        let n = 20;
+        let dial_handles: Vec<_> = (0..n)
+            .map(|_| {
+                let path = path.clone();
+                thread::spawn(move || UnixStream::connect(&path).unwrap())
+            })
+            .collect();
+        let streams: Vec<UnixStream> =
+            dial_handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Wait for the accept thread to register all subscribers.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let count = bus.subscribers.lock().unwrap().len();
+            if count >= n {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {count}/{n} subscribers registered before timeout"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        bus.publish(&Event::SessionCreated);
+        let expected = b"{\"type\":\"session.created\"}\n";
+        for mut stream in streams {
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = vec![0u8; expected.len()];
+            stream.read_exact(&mut buf).unwrap();
+            assert_eq!(buf.as_slice(), expected);
+        }
+    }
+
+    #[test]
+    fn bus_concurrent_publish_under_outer_lock_delivers_all_events() {
+        let bus = EventBus::new();
+        let rx = bus.register();
+        let outer: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+        let n_threads = 4;
+        let n_per_thread = 8;
+        let total = n_threads * n_per_thread;
+
+        let handles: Vec<_> = (0..n_threads)
+            .map(|_| {
+                let bus = Arc::clone(&bus);
+                let outer = Arc::clone(&outer);
+                thread::spawn(move || {
+                    for _ in 0..n_per_thread {
+                        let _g = outer.lock().unwrap();
+                        bus.publish(&Event::SessionCreated);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        for _ in 0..total {
+            rx.recv().unwrap();
+        }
+        assert!(rx.try_recv().is_err());
+    }
 }
