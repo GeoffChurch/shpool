@@ -86,7 +86,7 @@ impl EventBus {
 
     /// Register a new subscriber. Returns the receiver to be handed to a
     /// writer thread.
-    pub fn register(&self) -> Receiver<Arc<str>> {
+    fn register(&self) -> Receiver<Arc<str>> {
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE_DEPTH);
         self.subscribers.lock().push(tx);
         rx
@@ -145,13 +145,10 @@ impl Drop for ListenerGuard {
 }
 
 /// Bind the events socket and spawn the accept thread. For each accepted
-/// connection, `on_accept` is invoked with the stream; it is expected to
-/// register the subscriber with the bus and spawn a writer thread (see
-/// [`spawn_writer`]). The returned guard unlinks the socket file on drop.
-pub fn start_listener<F>(socket_path: PathBuf, on_accept: F) -> anyhow::Result<ListenerGuard>
-where
-    F: Fn(UnixStream) -> anyhow::Result<()> + Send + 'static,
-{
+/// connection, the subscriber is registered with `bus` and a writer
+/// thread is spawned to drain its queue. The returned guard unlinks the
+/// socket file on drop.
+pub fn start_listener(socket_path: PathBuf, bus: Arc<EventBus>) -> anyhow::Result<ListenerGuard> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
             .with_context(|| format!("removing stale events socket {:?}", socket_path))?;
@@ -161,19 +158,17 @@ where
     info!("events socket listening at {:?}", socket_path);
     thread::Builder::new()
         .name("events-accept".into())
-        .spawn(move || run_accept_loop(listener, on_accept))
+        .spawn(move || run_accept_loop(listener, bus))
         .context("spawning events accept thread")?;
     Ok(ListenerGuard { path: socket_path })
 }
 
-fn run_accept_loop<F>(listener: UnixListener, on_accept: F)
-where
-    F: Fn(UnixStream) -> anyhow::Result<()>,
-{
+fn run_accept_loop(listener: UnixListener, bus: Arc<EventBus>) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(e) = on_accept(stream) {
+                let receiver = bus.register();
+                if let Err(e) = spawn_writer(stream, receiver) {
                     warn!("accepting events subscriber: {:?}", e);
                 }
             }
@@ -187,7 +182,7 @@ where
 
 /// Set the write timeout and spawn a thread that drains `receiver` to
 /// `stream` until either side closes or a write times out.
-pub fn spawn_writer(stream: UnixStream, receiver: Receiver<Arc<str>>) -> anyhow::Result<()> {
+fn spawn_writer(stream: UnixStream, receiver: Receiver<Arc<str>>) -> anyhow::Result<()> {
     stream.set_write_timeout(Some(WRITE_TIMEOUT)).context("setting write timeout")?;
     thread::Builder::new()
         .name("events-writer".into())
@@ -309,7 +304,7 @@ mod tests {
     fn listener_guard_unlinks_socket_on_drop() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.socket");
-        let guard = start_listener(path.clone(), |_| Ok(())).unwrap();
+        let guard = start_listener(path.clone(), EventBus::new()).unwrap();
         assert!(path.exists(), "socket file should exist while guard is alive");
         drop(guard);
         assert!(!path.exists(), "socket file should be unlinked on guard drop");

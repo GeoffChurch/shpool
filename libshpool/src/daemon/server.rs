@@ -101,11 +101,13 @@ impl Server {
         // buffered so that we are unlikely to block when setting up a
         // new session
         let (new_sess_tx, new_sess_rx) = crossbeam_channel::bounded(10);
-        let shells_tab = Arc::clone(&shells);
-        let reaper_bus = Arc::clone(&events_bus);
-        thread::spawn(move || {
-            if let Err(e) = ttl_reaper::run(new_sess_rx, shells_tab, reaper_bus) {
-                warn!("ttl reaper exited with error: {:?}", e);
+        thread::spawn({
+            let shells = Arc::clone(&shells);
+            let events_bus = Arc::clone(&events_bus);
+            move || {
+                if let Err(e) = ttl_reaper::run(new_sess_rx, shells, events_bus) {
+                    warn!("ttl reaper exited with error: {:?}", e);
+                }
             }
         });
 
@@ -129,13 +131,7 @@ impl Server {
         self: &Arc<Self>,
         socket_path: PathBuf,
     ) -> anyhow::Result<events::ListenerGuard> {
-        let server = Arc::clone(self);
-        events::start_listener(socket_path, move |stream| server.handle_events_subscriber(stream))
-    }
-
-    fn handle_events_subscriber(&self, stream: UnixStream) -> anyhow::Result<()> {
-        let receiver = self.events_bus.register();
-        events::spawn_writer(stream, receiver)
+        events::start_listener(socket_path, Arc::clone(&self.events_bus))
     }
 
     #[instrument(skip_all)]
@@ -352,8 +348,9 @@ impl Server {
                 {
                     let _s = span!(Level::INFO, "2_lock(shells)").entered();
                     let mut shells = self.shells.lock();
-                    // Gated: a concurrent kill or reaper may have already
-                    // removed the entry and published its own removal.
+                    // The publish below is gated on `is_some()` because a
+                    // concurrent kill or reaper may have already removed the
+                    // entry (and published) while we were waiting for the lock.
                     if shells.remove(&header.name).is_some() {
                         self.events_bus.publish(&events::Event::SessionRemoved);
                     }
@@ -440,8 +437,8 @@ impl Server {
                             // the channel is still open so the subshell is still running
                             info!("taking over existing session inner");
                             inner.client_stream = Some(stream.try_clone()?);
-                            let now = time::SystemTime::now();
-                            session.lifecycle_timestamps.lock().last_connected_at = Some(now);
+                            session.lifecycle_timestamps.lock().last_connected_at =
+                                Some(time::SystemTime::now());
 
                             if inner
                                 .shell_to_client_join_h
@@ -767,7 +764,7 @@ impl Server {
     fn handle_list(&self, mut stream: UnixStream) -> anyhow::Result<()> {
         let _s = span!(Level::INFO, "lock(shells)").entered();
         let shells = self.shells.lock();
-        let sessions = shells
+        let sessions: Vec<Session> = shells
             .iter()
             .map(|(k, v)| {
                 let status = match v.inner.try_lock() {
@@ -794,7 +791,7 @@ impl Server {
                     status,
                 })
             })
-            .collect::<anyhow::Result<Vec<Session>>>()
+            .collect::<anyhow::Result<_>>()
             .context("collecting running session metadata")?;
         write_reply(&mut stream, ListReply { sessions })?;
         Ok(())

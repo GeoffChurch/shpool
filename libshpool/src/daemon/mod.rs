@@ -88,9 +88,10 @@ pub fn run(
     // RAII guard can run.
     let mut socks_to_clean: Vec<PathBuf> = cleanup_socket.iter().cloned().collect();
     socks_to_clean.push(events_socket.clone());
-    signals::Handler::new(socks_to_clean).spawn()?;
+    signals::Handler::new(socks_to_clean).spawn().context("spawning signal handler")?;
 
-    let _events_guard = server.start_events_listener(events_socket)?;
+    let _events_guard =
+        server.start_events_listener(events_socket).context("starting events listener")?;
 
     server::Server::serve(server, listener)?;
 

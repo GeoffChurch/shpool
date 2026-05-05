@@ -40,6 +40,10 @@ The daemon writes one JSON object per line (JSONL). Each event looks like:
 There are no other fields. To learn what the event refers to (which session,
 when, etc.), call `shpool list` (or use `ConnectHeader::List`).
 
+The format is robust: literal newline characters only appear as delimiters
+between events. Any newlines within JSON string values are automatically
+escaped (as `\n`) by the daemon.
+
 ## Subscribing
 
 For ad-hoc use, `shpool events` connects to the events socket and prints each
