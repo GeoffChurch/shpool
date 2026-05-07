@@ -154,9 +154,10 @@ impl Proc {
             if args.listen_events { Some(Events::new(&test_hook_socket_path)?) } else { None };
 
         // spin until we can dial the socket successfully
+        let events_socket_path = socket_path.with_file_name("events.socket");
         let mut sleep_dur = time::Duration::from_millis(5);
         for _ in 0..12 {
-            if UnixStream::connect(&socket_path).is_ok() {
+            if UnixStream::connect(&socket_path).is_ok() && events_socket_path.exists() {
                 break;
             } else {
                 std::thread::sleep(sleep_dur);
@@ -245,9 +246,10 @@ impl Proc {
         });
 
         // spin until we can dial the socket successfully
+        let events_socket_path = socket_path.with_file_name("events.socket");
         let mut sleep_dur = time::Duration::from_millis(5);
         for _ in 0..12 {
-            if UnixStream::connect(&socket_path).is_ok() {
+            if UnixStream::connect(&socket_path).is_ok() && events_socket_path.exists() {
                 break;
             } else {
                 std::thread::sleep(sleep_dur);

@@ -97,7 +97,7 @@ impl Server {
         >,
     ) -> anyhow::Result<Arc<Self>> {
         let shells = Arc::new(Mutex::new(HashMap::new()));
-        let events_bus = events::EventBus::new();
+        let events_bus = events::EventBus::new().context("creating events bus")?;
         // buffered so that we are unlikely to block when setting up a
         // new session
         let (new_sess_tx, new_sess_rx) = crossbeam_channel::bounded(10);
