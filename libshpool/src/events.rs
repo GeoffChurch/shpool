@@ -3,7 +3,10 @@
 //! Events are published to subscribers connected to a sibling Unix socket
 //! next to the main shpool socket. The wire format is JSON, one event per
 //! line (newline-delimited; aka JSONL). Non-Rust clients only need a Unix
-//! socket and a JSON parser to consume the stream.
+//! socket and a JSON parser to consume the stream. Literal newlines inside
+//! a JSON value are not possible: RFC 8259 §7 requires control characters
+//! (including U+000A LINE FEED) to be escaped inside strings, so framing
+//! by `\n` is unambiguous.
 //!
 //! Events carry no payload beyond their type — they signal that *something*
 //! changed in the session table. Subscribers learn the new state by calling
@@ -46,8 +49,8 @@ use tracing::{error, info, warn};
 /// far behind are dropped and must reconnect.
 const SUBSCRIBER_QUEUE_DEPTH: usize = 64;
 
-/// Capacity of the publish→sink channel. Reaching it means the sink is
-/// wedged — a real bug, not a tunable.
+/// Capacity of the publish-to-sink channel. Reaching it means the sink is
+/// wedged -- a real bug, not a tunable.
 const EVENT_CHANNEL_CAP: usize = 4096;
 
 /// An event published on the events socket.
@@ -87,7 +90,7 @@ impl EventBus {
     }
 
     /// Broadcast `event` to all current subscribers. Non-blocking: a
-    /// `try_send` on the publish→sink channel + a 1-byte wake. Takes no
+    /// `try_send` on the publish-to-sink channel + a 1-byte wake. Takes no
     /// internal lock, so it is safe to call under arbitrary outer locks.
     /// Publishing under the lock that protects the state being announced
     /// keeps wire-order = causal-order across mutators.
@@ -192,21 +195,29 @@ struct SinkHandles {
 fn run_sink(listener: UnixListener, handles: SinkHandles) {
     let SinkHandles { event_rx, wake_rx } = handles;
     let mut subs: Vec<SubscriberWriter> = Vec::new();
-    // Page-sized drain buffer; the bytes are signal-only and discarded.
+    // 4 KiB drain buffer; the bytes are signal-only and discarded.
     let mut wake_buf = [0u8; 4096];
+    // Reused across iterations to avoid reallocating each loop. `fds`
+    // can't be hoisted: its `PollFd<'_>` element type borrows from
+    // `subs[i]`, and the borrow checker tracks that by type, so the
+    // borrow on `subs` would persist past `clear()`.
+    let mut sub_pollfd_idx: Vec<usize> = Vec::new();
+    let mut sub_revents: Vec<PollFlags> = Vec::new();
 
     // Fixed positions in the poll set: 0 = wake fd, 1 = listener fd
-    // (revents ignored — see below), 2.. = subscribers wanting POLLOUT.
+    // (revents ignored -- see below), 2.. = subscribers wanting POLLOUT.
     const WAKE_FD_IDX: usize = 0;
     const SUB_FDS_START: usize = 2;
 
     loop {
+        sub_pollfd_idx.clear();
+        sub_revents.clear();
+
         // Build the poll set fresh each iteration: wake fd (POLLIN),
         // listener fd (POLLIN), each subscriber that wants POLLOUT.
         let mut fds: Vec<PollFd> = Vec::with_capacity(SUB_FDS_START + subs.len());
         fds.push(PollFd::new(wake_rx.as_fd(), PollFlags::POLLIN));
         fds.push(PollFd::new(listener.as_fd(), PollFlags::POLLIN));
-        let mut sub_pollfd_idx: Vec<usize> = Vec::with_capacity(subs.len());
         for (i, sub) in subs.iter().enumerate() {
             if sub.wants_pollout() {
                 fds.push(PollFd::new(sub.as_fd(), PollFlags::POLLOUT));
@@ -226,9 +237,10 @@ fn run_sink(listener: UnixListener, handles: SinkHandles) {
         // ignore the listener fd's revents deliberately; see the
         // always-accept comment below.
         let wake_revents = fds[WAKE_FD_IDX].revents().unwrap_or(PollFlags::empty());
-        let sub_revents: Vec<PollFlags> = (0..sub_pollfd_idx.len())
-            .map(|k| fds[SUB_FDS_START + k].revents().unwrap_or(PollFlags::empty()))
-            .collect();
+        sub_revents.extend(
+            (0..sub_pollfd_idx.len())
+                .map(|k| fds[SUB_FDS_START + k].revents().unwrap_or(PollFlags::empty())),
+        );
         drop(fds);
 
         // POLLHUP on wake_rx fires when the bus is dropped (write end
@@ -541,23 +553,16 @@ mod tests {
     }
 
     #[test]
-    fn session_created_serializes_with_only_type() {
-        assert_eq!(json(&Event::SessionCreated), r#"{"type":"session.created"}"#);
-    }
-
-    #[test]
-    fn session_attached_serializes_with_only_type() {
-        assert_eq!(json(&Event::SessionAttached), r#"{"type":"session.attached"}"#);
-    }
-
-    #[test]
-    fn session_detached_serializes_with_only_type() {
-        assert_eq!(json(&Event::SessionDetached), r#"{"type":"session.detached"}"#);
-    }
-
-    #[test]
-    fn session_removed_serializes_with_only_type() {
-        assert_eq!(json(&Event::SessionRemoved), r#"{"type":"session.removed"}"#);
+    fn events_serialize_with_only_type() {
+        let cases = [
+            (Event::SessionCreated, r#"{"type":"session.created"}"#),
+            (Event::SessionAttached, r#"{"type":"session.attached"}"#),
+            (Event::SessionDetached, r#"{"type":"session.detached"}"#),
+            (Event::SessionRemoved, r#"{"type":"session.removed"}"#),
+        ];
+        for (event, expected) in &cases {
+            assert_eq!(json(event), *expected, "variant {event:?}");
+        }
     }
 
     #[test]
@@ -875,12 +880,12 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::WriteZero);
     }
 
-    /// Property-style test: an arbitrary-shaped sequence of partial /
+    /// Scripted-scenario sweep: hand-rolled sequences of partial /
     /// EAGAIN / EINTR / full-accept responses, paired with new enqueues
     /// interleaved between drives, must eventually flush every enqueued
     /// byte once the plan ends with enough accepts to drain.
     #[test]
-    fn drive_pending_fuzz_eventually_flushes_everything() {
+    fn drive_pending_scripted_scenarios_flush_completely() {
         // Hand-rolled deterministic interleavings covering the
         // "queue-state-changed / POLLOUT-requested" atomicity: each row is
         // a sequence of (op, write-plan-entries) where op is "drive once"
@@ -1033,10 +1038,10 @@ mod tests {
 
     #[test]
     fn fast_writer_unaffected_when_slow_overflows() {
-        // Slow: small SndBuf, peer never reads → drive blocks → pending
-        // grows to cap → enqueue fails.
-        // Fast: default SndBuf, peer drains → drive flushes → pending
-        // stays empty → enqueue never fails.
+        // Slow: small SndBuf, peer never reads --> drive blocks --> pending
+        // grows to cap --> enqueue fails.
+        // Fast: default SndBuf, peer drains --> drive flushes --> pending
+        // stays empty --> enqueue never fails.
         let (slow_server, _slow_client) = UnixStream::pair().unwrap();
         nix::sys::socket::setsockopt(&slow_server, nix::sys::socket::sockopt::SndBuf, &1024)
             .unwrap();

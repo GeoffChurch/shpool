@@ -530,9 +530,7 @@ impl Server {
             // If we're replacing a stale entry whose shell process is
             // gone, surface that to subscribers before announcing the
             // replacement.
-            let clobbered = shells.contains_key(&header.name);
-            shells.insert(header.name.clone(), Box::new(session));
-            if clobbered {
+            if shells.insert(header.name.clone(), Box::new(session)).is_some() {
                 self.events_bus.publish(&events::Event::SessionRemoved);
             }
             self.events_bus.publish(&events::Event::SessionCreated);
