@@ -124,7 +124,7 @@ impl EventBus {
 /// Connect to the events socket, copy each line to stdout, and flush per
 /// line so the stream is usable in pipes (`shpool events | jq`). Returns
 /// when the daemon closes the connection.
-pub fn subscribe_to_stdout(socket_path: &Path) -> anyhow::Result<()> {
+pub fn run(socket_path: &Path) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket_path)
         .with_context(|| format!("connecting to events socket {:?}", socket_path))?;
     let reader = BufReader::new(stream);
