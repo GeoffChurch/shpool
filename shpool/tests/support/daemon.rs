@@ -4,6 +4,7 @@
 use std::{
     default::Default,
     env,
+    io::BufReader,
     os::unix::{net::UnixStream, prelude::ExitStatusExt as _},
     path::{Path, PathBuf},
     process,
@@ -268,6 +269,27 @@ impl Proc {
             bin_path: shpool_bin()?,
             hook_records: Some(hook_records),
         })
+    }
+
+    /// Path of the sibling events socket next to the main shpool socket.
+    pub fn events_socket_path(&self) -> PathBuf {
+        self.socket_path.with_file_name("events.socket")
+    }
+
+    /// Dial the events socket, retrying with exponential backoff until the
+    /// daemon has bound it. 9 iterations starting at 20ms double up to a
+    /// total max sleep of ~10.2s.
+    pub fn connect_events(&self) -> anyhow::Result<BufReader<UnixStream>> {
+        let path = self.events_socket_path();
+        let mut sleep_dur = time::Duration::from_millis(20);
+        for _ in 0..9 {
+            if let Ok(stream) = UnixStream::connect(&path) {
+                return Ok(BufReader::new(stream));
+            }
+            std::thread::sleep(sleep_dur);
+            sleep_dur *= 2;
+        }
+        Err(anyhow!("events socket never became available at {:?}", path))
     }
 
     pub fn proc_kill(&mut self) -> std::io::Result<()> {
