@@ -762,7 +762,7 @@ impl Server {
     fn handle_list(&self, mut stream: UnixStream) -> anyhow::Result<()> {
         let _s = span!(Level::INFO, "lock(shells)").entered();
         let shells = self.shells.lock();
-        let sessions: Vec<Session> = shells
+        let sessions: anyhow::Result<Vec<Session>> = shells
             .iter()
             .map(|(k, v)| {
                 let status = match v.inner.try_lock() {
@@ -789,8 +789,8 @@ impl Server {
                     status,
                 })
             })
-            .collect::<anyhow::Result<_>>()
-            .context("collecting running session metadata")?;
+            .collect();
+        let sessions = sessions.context("collecting running session metadata")?;
         write_reply(&mut stream, ListReply { sessions })?;
         Ok(())
     }

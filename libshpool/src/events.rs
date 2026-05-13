@@ -131,12 +131,12 @@ pub fn run(socket_path: &Path) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket_path)
         .with_context(|| format!("connecting to events socket {:?}", socket_path))?;
     let reader = BufReader::new(stream);
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut stdout = io::stdout().lock();
     for line in reader.lines() {
         let line = line.context("reading event")?;
-        writeln!(out, "{line}").context("writing event")?;
-        out.flush().context("flushing stdout")?;
+        stdout.write_all(line.as_bytes()).context("writing event")?;
+        stdout.write_all(b"\n").context("writing event newline")?;
+        stdout.flush().context("flushing stdout")?;
     }
     Ok(())
 }
@@ -243,13 +243,6 @@ fn run_sink(listener: UnixListener, handles: SinkHandles) {
         );
         drop(fds);
 
-        // POLLHUP on wake_rx fires when the bus is dropped (write end
-        // closes); falling through without entering the drain branch
-        // would leave POLLHUP latched and `poll()` returning immediately
-        // forever. Treat any wake-fd revent as "go read it" — read will
-        // return Ok(0) on EOF and we exit cleanly via that path.
-        let wake_ready = !wake_revents.is_empty();
-
         // Always drain pending accepts before processing wake/broadcast.
         // The listener is in the poll set so its POLLIN wakes us, but we
         // don't trust the revent for *whether* to accept: under load,
@@ -272,7 +265,12 @@ fn run_sink(listener: UnixListener, handles: SinkHandles) {
             }
         }
 
-        if wake_ready {
+        // POLLHUP on wake_rx fires when the bus is dropped (write end
+        // closes); falling through without entering the drain branch
+        // would leave POLLHUP latched and `poll()` returning immediately
+        // forever. Treat any wake-fd revent as "go read it" -- read will
+        // return Ok(0) on EOF and we exit cleanly via that path.
+        if !wake_revents.is_empty() {
             // Drain the wake pipe. Ok(0) means the EventBus was dropped;
             // no more events will ever arrive — exit cleanly.
             loop {

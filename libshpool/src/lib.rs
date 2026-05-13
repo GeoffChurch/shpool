@@ -237,9 +237,7 @@ you could just do `shpool var set workspace key-bugfix`.
 
 Connects to the events socket and writes each event (one JSON object
 per line) to stdout, flushing after every line so the stream is
-pipeline-friendly (e.g. `shpool events | jq`). The first line is a
-snapshot of the current session table; subsequent lines are deltas.
-Reconnect to force a fresh snapshot.")]
+pipeline-friendly (e.g. `shpool events | jq`).")]
     Events,
 }
 
