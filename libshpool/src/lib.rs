@@ -441,7 +441,7 @@ pub fn run(args: Args, hooks: Option<Box<dyn hooks::Hooks + Send + Sync>>) -> an
         Commands::List { json } => list::run(socket, json),
         Commands::SetLogLevel { level } => set_log_level::run(level, socket),
         Commands::Var { command } => var::run(socket, command),
-        Commands::Events => events::run(&events::socket_path(&socket)),
+        Commands::Events => events::run(&crate::daemon::events::socket_path(&socket)),
     };
 
     if let Err(err) = res {

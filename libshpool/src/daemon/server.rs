@@ -48,10 +48,10 @@ use crate::{
     config::MotdDisplayMode,
     consts,
     daemon::{
-        etc_environment, exit_notify::ExitNotifier, hooks, pager, pager::PagerError, prompt, shell,
-        show_motd, ttl_reaper,
+        etc_environment, events, exit_notify::ExitNotifier, hooks, pager, pager::PagerError,
+        prompt, shell, show_motd, ttl_reaper,
     },
-    events, protocol, test_hooks, tty, user,
+    protocol, test_hooks, tty, user,
 };
 
 const DEFAULT_INITIAL_SHELL_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";

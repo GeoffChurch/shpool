@@ -30,8 +30,8 @@ use std::{
 use parking_lot::Mutex;
 use tracing::{info, span, warn, Level};
 
+use super::events;
 use super::shell;
-use crate::events;
 
 /// Run the reaper thread loop. Should be invoked in a dedicated
 /// thread.

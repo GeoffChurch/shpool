@@ -17,9 +17,10 @@ use std::{env, os::unix::net::UnixListener, path::PathBuf};
 use anyhow::Context;
 use tracing::{info, instrument};
 
-use crate::{config, consts, events, hooks};
+use crate::{config, consts, hooks};
 
 mod etc_environment;
+pub(crate) mod events;
 mod exit_notify;
 pub mod keybindings;
 mod pager;
