@@ -114,9 +114,13 @@ impl EventBus {
                 return;
             }
         }
-        // Wake the sink. If the pipe's kernel buffer is full (sink is
-        // already buried) our 1-byte signal is redundant — drop it.
-        let _ = unistd::write(&self.wake_tx, b"\0");
+        // Wake the sink. A full pipe buffer (EAGAIN) means an unread wake is already
+        // pending, so this nudge is redundant -- expected under burst, not logged. Any
+        // other errno (EBADF, EIO, ...) is a real fault and is surfaced.
+        match unistd::write(&self.wake_tx, b"\0") {
+            Ok(_) | Err(Errno::EAGAIN) => {}
+            Err(e) => warn!("waking events sink: {e}"),
+        }
     }
 
     fn take_sink_handles(&self) -> Option<SinkHandles> {
