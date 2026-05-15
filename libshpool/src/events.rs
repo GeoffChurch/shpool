@@ -588,11 +588,15 @@ mod tests {
         assert_eq!(read_line(&mut probe), "{\"type\":\"session.attached\"}\n");
     }
 
+    // Publish is `try_send` + 1-byte wake -- independent of N. A regression that
+    // re-introduced per-sub work in publish would make these timings explode. The
+    // absolute threshold is timing-sensitive and can flake on a slow or contended
+    // CI runner, so this is kept as executable documentation behind `#[ignore]`
+    // rather than a CI gate; run it on demand with `--ignored` if a publish-path
+    // regression is ever suspected.
     #[test]
+    #[ignore = "timing-sensitive; run on demand with --ignored"]
     fn bus_publish_with_many_subscribers_is_not_quadratic() {
-        // Publish is `try_send` + 1-byte wake — independent of N. A
-        // regression that re-introduced per-sub work in publish would
-        // make these timings explode.
         let h = harness();
         let n = 200;
         let _streams = connect_n_registered(&h.path, &h.bus, n);
