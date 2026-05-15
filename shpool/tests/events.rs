@@ -129,6 +129,69 @@ fn reattach_emits_attached_only() -> anyhow::Result<()> {
     Ok(())
 }
 
+// Force-reattach (`shpool attach -f`) onto a session that already has a client
+// attached: the daemon kicks the old client and the new one takes over the
+// *same* subshell. Exactly one `session.detached` (the kick) and one
+// `session.attached` (the takeover) should fire, with no
+// `session.created`/`session.removed` -- the subshell process survives the
+// whole handover. A kill fence pins this: with the subshell still alive, the
+// known next event is `session.removed`, so a duplicate detached on the kick or
+// a stray create/remove would surface there instead.
+#[test]
+#[timeout(30000)]
+fn force_reattach_kicks_old_client_and_keeps_subshell() -> anyhow::Result<()> {
+    let mut d = daemon::Proc::new(
+        "norc.toml",
+        DaemonArgs { listen_events: false, ..DaemonArgs::default() },
+    )
+    .context("starting daemon proc")?;
+    let mut sub = d.connect_events()?;
+
+    // Foreground attach (no `background`) keeps the client attached and holding the
+    // session's inner lock, so the forced attach below actually hits the busy path.
+    let _attach1 = d
+        .attach("s", AttachArgs { null_stdin: true, ..AttachArgs::default() })
+        .context("first attach")?;
+    assert_eq!(next_event(&mut sub)?["type"], "session.created");
+    assert_eq!(next_event(&mut sub)?["type"], "session.attached");
+
+    // Ensure attach1 is fully attached before forcing; otherwise attach2 could win
+    // the create/reattach race without a kick and no `session.detached` would fire.
+    d.wait_until_list_matches(|out| out.contains("attached"))?;
+
+    let _attach2 = d
+        .attach("s", AttachArgs { force: true, null_stdin: true, ..AttachArgs::default() })
+        .context("forced reattach")?;
+
+    assert_eq!(
+        next_event(&mut sub)?["type"],
+        "session.detached",
+        "expected the old client to be kicked"
+    );
+    let attached = next_event(&mut sub)?;
+    assert_eq!(
+        attached["type"], "session.attached",
+        "expected attached on forced reattach, got {attached}"
+    );
+
+    // Sync so any late detached from the kicked client's unwind would already be
+    // queued, then fence with a kill: the subshell is still alive, so the next
+    // event must be exactly `session.removed`.
+    d.wait_until_list_matches(|out| out.contains("attached"))?;
+
+    let kill_out = d.kill(vec!["s".into()]).context("running kill")?;
+    assert!(kill_out.status.success(), "kill failed: {:?}", kill_out);
+
+    let next = next_event(&mut sub)?;
+    assert_eq!(
+        next["type"], "session.removed",
+        "expected next event to be removed, got {next} -- possible duplicate \
+         detached or stray create/remove on the force-reattach path"
+    );
+
+    Ok(())
+}
+
 // SIGTERM should clean up both sockets via the signal handler, since
 // process::exit bypasses any RAII guard.
 #[test]
