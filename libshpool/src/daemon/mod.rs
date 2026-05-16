@@ -62,7 +62,11 @@ pub fn run(
 
     info!("\n\n======================== STARTING DAEMON ============================\n\n");
 
-    let server = server::Server::new(config_manager, hooks, runtime_dir, log_level_handle)?;
+    let events_socket = events::socket_path(&socket);
+    let (events_bus, _events_handle) =
+        events::EventBus::start(events_socket.clone()).context("starting events bus")?;
+    let server =
+        server::Server::new(config_manager, hooks, runtime_dir, log_level_handle, events_bus)?;
 
     let (cleanup_socket, listener) = match systemd::activation_socket() {
         Ok(l) => {
@@ -82,17 +86,14 @@ pub fn run(
             (Some(socket.clone()), UnixListener::bind(&socket).context("binding to socket")?)
         }
     };
-    let events_socket = events::socket_path(&socket);
 
     // spawn the signal handler thread in the background. Both sockets need
     // explicit cleanup on signal exit because the process exits before any
-    // RAII guard can run.
+    // RAII guard can run -- the signal path bypasses the sink's RAII socket
+    // cleanup, so it stays as a belt-and-suspenders unlink.
     let mut socks_to_clean: Vec<PathBuf> = cleanup_socket.iter().cloned().collect();
     socks_to_clean.push(events_socket.clone());
     signals::Handler::new(socks_to_clean).spawn().context("spawning signal handler")?;
-
-    let _events_guard =
-        server.start_events_listener(events_socket).context("starting events listener")?;
 
     server::Server::serve(server, listener)?;
 

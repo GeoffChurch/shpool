@@ -95,9 +95,9 @@ impl Server {
             tracing_subscriber::filter::LevelFilter,
             tracing_subscriber::registry::Registry,
         >,
+        events_bus: Arc<events::EventBus>,
     ) -> anyhow::Result<Arc<Self>> {
         let shells = Arc::new(Mutex::new(HashMap::new()));
-        let events_bus = events::EventBus::new().context("creating events bus")?;
         // buffered so that we are unlikely to block when setting up a
         // new session
         let (new_sess_tx, new_sess_rx) = crossbeam_channel::bounded(10);
@@ -123,15 +123,6 @@ impl Server {
             log_level_handle,
             vars: HashMap::new().into(),
         }))
-    }
-
-    /// Bind the events socket and spawn the accept thread. The returned
-    /// guard unlinks the socket file on drop.
-    pub fn start_events_listener(
-        self: &Arc<Self>,
-        socket_path: PathBuf,
-    ) -> anyhow::Result<events::ListenerGuard> {
-        events::start_listener(socket_path, Arc::clone(&self.events_bus))
     }
 
     #[instrument(skip_all)]

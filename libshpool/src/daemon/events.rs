@@ -41,7 +41,6 @@ use nix::{
     poll::{self, PollFd, PollFlags, PollTimeout},
     unistd,
 };
-use parking_lot::Mutex;
 use serde_derive::Serialize;
 use tracing::{error, info, warn};
 
@@ -68,25 +67,50 @@ pub enum Event {
     SessionRemoved,
 }
 
-/// Fans out events to all connected subscribers via a single sink thread
-/// doing non-blocking I/O.
+/// The publish surface of the events system: fans out events to all
+/// connected subscribers via a single background sink thread. Freely
+/// cloneable (each clone shares the one sink). The sink's lifetime is
+/// owned by the [`EventBusHandle`] returned alongside this from
+/// [`EventBus::start`]; dropping that handle stops and joins the sink.
 pub struct EventBus {
     event_tx: SyncSender<Arc<str>>,
     wake_tx: OwnedFd,
-    sink_handles: Mutex<Option<SinkHandles>>,
     sink_dead_logged: AtomicBool,
 }
 
 impl EventBus {
-    pub fn new() -> io::Result<Arc<Self>> {
+    /// Bind the events socket, spawn the sink thread, and return the
+    /// shareable publish handle together with an [`EventBusHandle`] that
+    /// owns the sink's lifetime. The sink owns the socket-file guard, so
+    /// the socket file is unlinked exactly when the sink exits.
+    pub fn start(socket_path: PathBuf) -> anyhow::Result<(Arc<Self>, EventBusHandle)> {
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path)
+                .with_context(|| format!("removing stale events socket {:?}", socket_path))?;
+        }
+        let listener = UnixListener::bind(&socket_path)
+            .with_context(|| format!("binding events socket {:?}", socket_path))?;
+        listener.set_nonblocking(true).context("setting events listener non-blocking")?;
+        info!("events socket listening at {:?}", socket_path);
+
         let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CHANNEL_CAP);
-        let (wake_rx, wake_tx) = make_self_pipe()?;
-        Ok(Arc::new(Self {
-            event_tx,
-            wake_tx,
-            sink_handles: Mutex::new(Some(SinkHandles { event_rx, wake_rx })),
-            sink_dead_logged: AtomicBool::new(false),
-        }))
+        let (wake_rx, wake_tx) = make_self_pipe().context("creating events wake pipe")?;
+        let (shutdown_rx, shutdown_tx) =
+            make_self_pipe().context("creating events shutdown pipe")?;
+
+        let bus = Arc::new(Self { event_tx, wake_tx, sink_dead_logged: AtomicBool::new(false) });
+        let sink = Sink {
+            listener,
+            event_rx,
+            wake_rx,
+            shutdown_rx,
+            _guard: ListenerGuard { path: socket_path },
+        };
+        let join = thread::Builder::new()
+            .name("events-sink".into())
+            .spawn(move || sink.run())
+            .context("spawning events sink thread")?;
+        Ok((bus, EventBusHandle { shutdown_tx, sink: Some(join) }))
     }
 
     /// Broadcast `event` to all current subscribers. Non-blocking: a
@@ -122,9 +146,34 @@ impl EventBus {
             Err(e) => warn!("waking events sink: {e}"),
         }
     }
+}
 
-    fn take_sink_handles(&self) -> Option<SinkHandles> {
-        self.sink_handles.lock().take()
+/// Owns the events-sink thread. Dropping it signals the sink to stop --
+/// the sink then drops its socket-file guard (unlinking the socket) --
+/// and joins the thread, so the sink can never outlive this handle. Not
+/// `Clone`: there is exactly one owner of the sink's lifetime, which is
+/// what makes "close the bus" a single, deterministic action.
+pub struct EventBusHandle {
+    shutdown_tx: OwnedFd,
+    sink: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for EventBusHandle {
+    fn drop(&mut self) {
+        // Nudge the dedicated shutdown pipe so the sink's `poll` wakes, sees it, and
+        // returns (dropping its `ListenerGuard`). `EPIPE` means the sink already exited
+        // on its own via the wake-EOF fallback and closed its read end -- expected and
+        // benign; the join below is then a no-op. Any other errno is a real fault worth
+        // surfacing: a genuinely lost nudge can leave the join below hanging forever.
+        match unistd::write(&self.shutdown_tx, b"\0") {
+            Ok(_) | Err(Errno::EPIPE) => {}
+            Err(e) => warn!("signaling events sink shutdown: {e}"),
+        }
+        if let Some(join) = self.sink.take() {
+            if let Err(e) = join.join() {
+                warn!("joining events sink thread: {:?}", e);
+            }
+        }
     }
 }
 
@@ -154,174 +203,174 @@ impl Drop for ListenerGuard {
     }
 }
 
-/// Bind the events socket and spawn the sink thread. The sink owns the
-/// listener fd and all subscriber state; it accepts connections and drives
-/// non-blocking writes via `poll(2)`. The returned guard unlinks the
-/// socket file on drop.
-pub fn start_listener(socket_path: PathBuf, bus: Arc<EventBus>) -> anyhow::Result<ListenerGuard> {
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)
-            .with_context(|| format!("removing stale events socket {:?}", socket_path))?;
-    }
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("binding events socket {:?}", socket_path))?;
-    listener.set_nonblocking(true).context("setting events listener non-blocking")?;
-    info!("events socket listening at {:?}", socket_path);
-
-    let handles = bus.take_sink_handles().context("events sink already started")?;
-    thread::Builder::new()
-        .name("events-sink".into())
-        .spawn(move || run_sink(listener, handles))
-        .context("spawning events sink thread")?;
-    Ok(ListenerGuard { path: socket_path })
-}
-
-struct SinkHandles {
+/// All sink-thread-owned state: the listener, the channel/pipe receive
+/// ends, and the socket-file guard. The guard is a field so it drops --
+/// unlinking the socket -- exactly when [`Sink::run`] returns, so the
+/// socket file never outlives the thread serving it.
+struct Sink {
+    listener: UnixListener,
     event_rx: Receiver<Arc<str>>,
     wake_rx: OwnedFd,
+    shutdown_rx: OwnedFd,
+    _guard: ListenerGuard,
 }
 
-fn run_sink(listener: UnixListener, handles: SinkHandles) {
-    let SinkHandles { event_rx, wake_rx } = handles;
-    let mut subs: Vec<SubscriberWriter> = Vec::new();
-    // 4 KiB drain buffer; the bytes are signal-only and discarded.
-    let mut wake_buf = [0u8; 4096];
-    // Reused across iterations to avoid reallocating each loop. `fds`
-    // can't be hoisted: its `PollFd<'_>` element type borrows from
-    // `subs[i]`, and the borrow checker tracks that by type, so the
-    // borrow on `subs` would persist past `clear()`.
-    let mut sub_pollfd_idx: Vec<usize> = Vec::new();
-    let mut sub_revents: Vec<PollFlags> = Vec::new();
+impl Sink {
+    fn run(self) {
+        let Sink { listener, event_rx, wake_rx, shutdown_rx, _guard } = self;
+        let mut subs: Vec<SubscriberWriter> = Vec::new();
+        // 4 KiB drain buffer; the bytes are signal-only and discarded.
+        let mut wake_buf = [0u8; 4096];
+        // Reused across iterations to avoid reallocating each loop. `fds`
+        // can't be hoisted: its `PollFd<'_>` element type borrows from
+        // `subs[i]`, and the borrow checker tracks that by type, so the
+        // borrow on `subs` would persist past `clear()`.
+        let mut sub_pollfd_idx: Vec<usize> = Vec::new();
+        let mut sub_revents: Vec<PollFlags> = Vec::new();
 
-    // Fixed positions in the poll set: 0 = wake fd, 1 = listener fd
-    // (revents ignored -- see below), 2.. = subscribers wanting POLLOUT.
-    const WAKE_FD_IDX: usize = 0;
-    const SUB_FDS_START: usize = 2;
+        // Fixed positions in the poll set: 0 = wake fd, 1 = listener fd
+        // (revents ignored -- see below), 2 = shutdown fd, 3.. =
+        // subscribers wanting POLLOUT.
+        const WAKE_FD_IDX: usize = 0;
+        const SHUTDOWN_FD_IDX: usize = 2;
+        const SUB_FDS_START: usize = 3;
 
-    loop {
-        sub_pollfd_idx.clear();
-        sub_revents.clear();
-
-        // Build the poll set fresh each iteration: wake fd (POLLIN),
-        // listener fd (POLLIN), each subscriber that wants POLLOUT.
-        let mut fds: Vec<PollFd> = Vec::with_capacity(SUB_FDS_START + subs.len());
-        fds.push(PollFd::new(wake_rx.as_fd(), PollFlags::POLLIN));
-        fds.push(PollFd::new(listener.as_fd(), PollFlags::POLLIN));
-        for (i, sub) in subs.iter().enumerate() {
-            if sub.wants_pollout() {
-                fds.push(PollFd::new(sub.as_fd(), PollFlags::POLLOUT));
-                sub_pollfd_idx.push(i);
-            }
-        }
-
-        match poll::poll(&mut fds, PollTimeout::NONE) {
-            Ok(_) => {}
-            Err(Errno::EINTR) => continue,
-            Err(e) => panic!("events sink poll: {:?}", e),
-        }
-
-        // Extract revents into owned values before any mutation: each
-        // `PollFd<'fd>` borrows from the fd source (including `subs`), so
-        // we drop `fds` before accept / broadcast / drive can run. We
-        // ignore the listener fd's revents deliberately; see the
-        // always-accept comment below.
-        let wake_revents = fds[WAKE_FD_IDX].revents().unwrap_or(PollFlags::empty());
-        sub_revents.extend(
-            (0..sub_pollfd_idx.len())
-                .map(|k| fds[SUB_FDS_START + k].revents().unwrap_or(PollFlags::empty())),
-        );
-        drop(fds);
-
-        // Always drain pending accepts before processing wake/broadcast.
-        // The listener is in the poll set so its POLLIN wakes us, but we
-        // don't trust the revent for *whether* to accept: under load,
-        // listener POLLIN can lag behind `connect(2)` returning, and if
-        // we were woken by the wake-fd alone we still want to catch any
-        // queued connections so the same iteration's broadcast reaches
-        // them. The accept syscall is cheap (returns WouldBlock
-        // immediately when the queue is empty).
         loop {
-            match listener.accept() {
-                Ok((stream, _addr)) => match SubscriberWriter::new(stream) {
-                    Ok(sub) => subs.push(sub),
-                    Err(e) => warn!("registering events subscriber: {:?}", e),
-                },
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    error!("events listener accept: {:?}", e);
-                    break;
-                }
-            }
-        }
+            sub_pollfd_idx.clear();
+            sub_revents.clear();
 
-        // POLLHUP on wake_rx fires when the bus is dropped (write end
-        // closes); falling through without entering the drain branch
-        // would leave POLLHUP latched and `poll()` returning immediately
-        // forever. Treat any wake-fd revent as "go read it" -- read will
-        // return Ok(0) on EOF and we exit cleanly via that path.
-        if !wake_revents.is_empty() {
-            // Drain the wake pipe. Ok(0) means the EventBus was dropped;
-            // no more events will ever arrive — exit cleanly.
-            loop {
-                match unistd::read(&wake_rx, &mut wake_buf) {
-                    Ok(0) => return,
-                    Ok(_) => continue,
-                    Err(Errno::EAGAIN) => break,
-                    Err(Errno::EINTR) => continue,
-                    Err(e) => panic!("events sink reading wake fd: {:?}", e),
+            // Build the poll set fresh each iteration: wake fd (POLLIN),
+            // listener fd (POLLIN), each subscriber that wants POLLOUT.
+            let mut fds: Vec<PollFd> = Vec::with_capacity(SUB_FDS_START + subs.len());
+            fds.push(PollFd::new(wake_rx.as_fd(), PollFlags::POLLIN));
+            fds.push(PollFd::new(listener.as_fd(), PollFlags::POLLIN));
+            fds.push(PollFd::new(shutdown_rx.as_fd(), PollFlags::POLLIN));
+            for (i, sub) in subs.iter().enumerate() {
+                if sub.wants_pollout() {
+                    fds.push(PollFd::new(sub.as_fd(), PollFlags::POLLOUT));
+                    sub_pollfd_idx.push(i);
                 }
             }
-            // Drain event channel and broadcast. After each enqueue, if
-            // the sub's pending was empty before, drive opportunistically:
-            // a fast consumer's kernel buffer is likely ready, so the
-            // event flushes immediately and the next enqueue starts from
-            // empty. Without this, a burst larger than SUBSCRIBER_QUEUE_DEPTH
-            // would overflow even healthy subs because broadcast enqueues
-            // every event before any drive runs.
-            while let Ok(line) = event_rx.try_recv() {
-                for sub in subs.iter_mut() {
-                    if sub.dropped {
-                        continue;
+
+            match poll::poll(&mut fds, PollTimeout::NONE) {
+                Ok(_) => {}
+                Err(Errno::EINTR) => continue,
+                Err(e) => panic!("events sink poll: {:?}", e),
+            }
+
+            // Extract revents into owned values before any mutation: each
+            // `PollFd<'fd>` borrows from the fd source (including `subs`), so
+            // we drop `fds` before accept / broadcast / drive can run. We
+            // ignore the listener fd's revents deliberately; see the
+            // always-accept comment below.
+            let wake_revents = fds[WAKE_FD_IDX].revents().unwrap_or(PollFlags::empty());
+            let shutdown_revents = fds[SHUTDOWN_FD_IDX].revents().unwrap_or(PollFlags::empty());
+            sub_revents.extend(
+                (0..sub_pollfd_idx.len())
+                    .map(|k| fds[SUB_FDS_START + k].revents().unwrap_or(PollFlags::empty())),
+            );
+            drop(fds);
+
+            // The owning `EventBusHandle` was dropped (it nudged or closed the
+            // shutdown pipe). Stop now; returning drops the destructured
+            // `_guard`, which unlinks the socket file -- so the socket never
+            // outlives the thread serving it.
+            if !shutdown_revents.is_empty() {
+                return;
+            }
+
+            // Always drain pending accepts before processing wake/broadcast.
+            // The listener is in the poll set so its POLLIN wakes us, but we
+            // don't trust the revent for *whether* to accept: under load,
+            // listener POLLIN can lag behind `connect(2)` returning, and if
+            // we were woken by the wake-fd alone we still want to catch any
+            // queued connections so the same iteration's broadcast reaches
+            // them. The accept syscall is cheap (returns WouldBlock
+            // immediately when the queue is empty).
+            loop {
+                match listener.accept() {
+                    Ok((stream, _addr)) => match SubscriberWriter::new(stream) {
+                        Ok(sub) => subs.push(sub),
+                        Err(e) => warn!("registering events subscriber: {:?}", e),
+                    },
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        error!("events listener accept: {:?}", e);
+                        break;
                     }
-                    let was_empty = !sub.wants_pollout();
-                    if let Err(Overflow::CapExceeded) = sub.enqueue(Arc::clone(&line)) {
-                        warn!("dropping events subscriber: queue full");
-                        sub.dropped = true;
-                        continue;
+                }
+            }
+
+            // POLLHUP on wake_rx fires when the bus is dropped (write end
+            // closes); falling through without entering the drain branch
+            // would leave POLLHUP latched and `poll()` returning immediately
+            // forever. Treat any wake-fd revent as "go read it" -- read will
+            // return Ok(0) on EOF and we exit cleanly via that path.
+            if !wake_revents.is_empty() {
+                // Drain the wake pipe. Ok(0) means the EventBus was dropped;
+                // no more events will ever arrive — exit cleanly.
+                loop {
+                    match unistd::read(&wake_rx, &mut wake_buf) {
+                        Ok(0) => return,
+                        Ok(_) => continue,
+                        Err(Errno::EAGAIN) => break,
+                        Err(Errno::EINTR) => continue,
+                        Err(e) => panic!("events sink reading wake fd: {:?}", e),
                     }
-                    if was_empty {
-                        if let Err(e) = sub.drive() {
-                            info!("events subscriber gone: {:?}", e);
+                }
+                // Drain event channel and broadcast. After each enqueue, if
+                // the sub's pending was empty before, drive opportunistically:
+                // a fast consumer's kernel buffer is likely ready, so the
+                // event flushes immediately and the next enqueue starts from
+                // empty. Without this, a burst larger than SUBSCRIBER_QUEUE_DEPTH
+                // would overflow even healthy subs because broadcast enqueues
+                // every event before any drive runs.
+                while let Ok(line) = event_rx.try_recv() {
+                    for sub in subs.iter_mut() {
+                        if sub.dropped {
+                            continue;
+                        }
+                        let was_empty = !sub.wants_pollout();
+                        if let Err(Overflow::CapExceeded) = sub.enqueue(Arc::clone(&line)) {
+                            warn!("dropping events subscriber: queue full");
                             sub.dropped = true;
+                            continue;
+                        }
+                        if was_empty {
+                            if let Err(e) = sub.drive() {
+                                info!("events subscriber gone: {:?}", e);
+                                sub.dropped = true;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Drive writes for subs whose POLLOUT (or error) fired.
-        for (k, &i) in sub_pollfd_idx.iter().enumerate() {
-            // Short-circuit: a sub marked dropped during the broadcast
-            // above (overflow or opportunistic-drive failure) is removed
-            // by `subs.retain` at the end of this iteration anyway, but
-            // driving it again here would cost a needless `write(2)` on
-            // a likely-broken stream.
-            if subs[i].dropped {
-                continue;
-            }
-            let revents = sub_revents[k];
-            if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
-                info!("events subscriber gone: peer error/hangup");
-                subs[i].dropped = true;
-            } else if revents.contains(PollFlags::POLLOUT) {
-                if let Err(e) = subs[i].drive() {
-                    info!("events subscriber gone: {:?}", e);
+            // Drive writes for subs whose POLLOUT (or error) fired.
+            for (k, &i) in sub_pollfd_idx.iter().enumerate() {
+                // Short-circuit: a sub marked dropped during the broadcast
+                // above (overflow or opportunistic-drive failure) is removed
+                // by `subs.retain` at the end of this iteration anyway, but
+                // driving it again here would cost a needless `write(2)` on
+                // a likely-broken stream.
+                if subs[i].dropped {
+                    continue;
+                }
+                let revents = sub_revents[k];
+                if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+                {
+                    info!("events subscriber gone: peer error/hangup");
                     subs[i].dropped = true;
+                } else if revents.contains(PollFlags::POLLOUT) {
+                    if let Err(e) = subs[i].drive() {
+                        info!("events subscriber gone: {:?}", e);
+                        subs[i].dropped = true;
+                    }
                 }
             }
-        }
 
-        subs.retain(|sub| !sub.dropped);
+            subs.retain(|sub| !sub.dropped);
+        }
     }
 }
 
@@ -450,6 +499,7 @@ fn make_self_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use std::{
         io::{BufRead, BufReader, Read},
         time::{Duration, Instant},
@@ -459,22 +509,22 @@ mod tests {
         serde_json::to_string(event).unwrap()
     }
 
-    /// Per-test scaffolding: tempdir + socket path + bus + listener guard.
-    /// Holds RAII handles so the socket file is unlinked and the dir is
-    /// cleaned up at end-of-scope.
+    /// Per-test scaffolding: tempdir + socket path + bus + sink handle.
+    /// `_handle` is declared first so it drops first at end-of-scope --
+    /// shutting down and joining the sink (which unlinks the socket)
+    /// before the tempdir is removed.
     struct Harness {
-        _dir: tempfile::TempDir,
-        _guard: ListenerGuard,
-        path: PathBuf,
+        _handle: EventBusHandle,
         bus: Arc<EventBus>,
+        path: PathBuf,
+        _dir: tempfile::TempDir,
     }
 
     fn harness() -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.socket");
-        let bus = EventBus::new().unwrap();
-        let _guard = start_listener(path.clone(), Arc::clone(&bus)).unwrap();
-        Harness { _dir: dir, _guard, path, bus }
+        let (bus, _handle) = EventBus::start(path.clone()).unwrap();
+        Harness { _handle, bus, path, _dir: dir }
     }
 
     /// Read timeout used for all blocking reads in tests. Generous so
@@ -554,7 +604,8 @@ mod tests {
 
     #[test]
     fn bus_publish_with_no_subscribers_is_a_noop() {
-        let bus = EventBus::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (bus, _handle) = EventBus::start(dir.path().join("events.socket")).unwrap();
         bus.publish(&Event::SessionCreated);
     }
 
@@ -634,14 +685,21 @@ mod tests {
         }
     }
 
+    // Dropping the handle must stop the sink AND unlink the socket: the
+    // handle joins the sink, the sink owns the socket-file guard, so once
+    // `drop` returns the thread is gone and the socket file with it. This
+    // pins "the sink can never outlive the socket file."
     #[test]
-    fn listener_guard_unlinks_socket_on_drop() {
+    fn dropping_handle_stops_sink_and_unlinks_socket() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.socket");
-        let guard = start_listener(path.clone(), EventBus::new().unwrap()).unwrap();
-        assert!(path.exists(), "socket file should exist while guard is alive");
-        drop(guard);
-        assert!(!path.exists(), "socket file should be unlinked on guard drop");
+        let (_bus, handle) = EventBus::start(path.clone()).unwrap();
+        assert!(path.exists(), "socket file should exist while the sink runs");
+        drop(handle);
+        assert!(
+            !path.exists(),
+            "socket file should be unlinked once the sink is shut down and joined"
+        );
     }
 
     #[test]
@@ -710,19 +768,9 @@ mod tests {
 
     #[test]
     fn slow_subscriber_drop_does_not_affect_fast_through_sink() {
-        // The harness uses `start_listener`; this test bypasses it so the
-        // listener is bound directly with the desired socket options.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.socket");
-        let bus = EventBus::new().unwrap();
-
-        let listener = UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let handles = bus.take_sink_handles().unwrap();
-        thread::Builder::new()
-            .name("events-sink".into())
-            .spawn(move || run_sink(listener, handles))
-            .unwrap();
+        let (bus, _handle) = EventBus::start(path.clone()).unwrap();
 
         // Small SO_RCVBUF on slow caps how much un-read data the kernel
         // will buffer en-route to it; the sink's writes start returning
