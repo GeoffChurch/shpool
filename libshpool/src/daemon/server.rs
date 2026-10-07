@@ -870,6 +870,7 @@ impl Server {
                     status,
                     shell_pid: session.child_pid,
                     attachments: lifecycle_state.attachment.into_iter().collect(),
+                    window_title: session.window_title.get(),
                 })
             })
             .collect();
@@ -1220,6 +1221,7 @@ impl Server {
             supports_sentinels,
         };
         let child_pid = session_inner.pty_master.child_pid().ok_or(anyhow!("no child pid"))?;
+        let window_title = Arc::new(shell::SessionWindowTitle::default());
         session_inner.shell_to_client_join_h =
             Some(session_inner.spawn_shell_to_client(shell::ShellToClientArgs {
                 conn_id,
@@ -1240,6 +1242,7 @@ impl Server {
                 heartbeat_ack: heartbeat_ack_tx,
                 maybe_switch: maybe_switch_rx,
                 child_exit_notifier: shell_to_client_child_exit_notifier,
+                window_title: Arc::clone(&window_title),
             })?);
 
         if let Some(ttl_secs) = header.ttl_secs {
@@ -1256,6 +1259,7 @@ impl Server {
             child_exit_notifier,
             started_at: time::SystemTime::now(),
             lifecycle: shell::SessionLifecycle::default(),
+            window_title,
             inner: Arc::new(Mutex::new(session_inner)),
         })
     }

@@ -294,6 +294,11 @@ pub struct Session {
     /// independently of `status`, so they can briefly disagree.
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    /// This session's window title. None if it is unset or empty, or if
+    /// `session_restore_mode` is `simple`. Non-UTF-8 bytes are replaced with
+    /// U+FFFD.
+    #[serde(default)]
+    pub window_title: Option<String>,
 }
 
 /// A session's attachment.

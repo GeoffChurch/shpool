@@ -541,3 +541,75 @@ fn json_attachment_kill_removes_session() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Start a daemon with `config` and attach a session named sh1 to it.
+fn attach_sh1(config: &str) -> anyhow::Result<(support::daemon::Proc, support::attach::Proc)> {
+    let mut daemon_proc = support::daemon::Proc::new(config, DaemonArgs::default())
+        .context("starting daemon proc")?;
+    let bidi_enter_w = daemon_proc.events.take().unwrap().waiter(["daemon-bidi-stream-enter"]);
+    let sess1 = daemon_proc.attach("sh1", Default::default())?;
+    daemon_proc.events = Some(bidi_enter_w.wait_final_event("daemon-bidi-stream-enter")?);
+    Ok((daemon_proc, sess1))
+}
+
+/// The window title `shpool list --json` reports for sh1.
+fn sh1_window_title(daemon_proc: &mut support::daemon::Proc) -> anyhow::Result<Value> {
+    let sessions = list_sessions(daemon_proc)?;
+    let sh1 =
+        sessions.iter().find(|s| s["name"] == "sh1").ok_or_else(|| anyhow!("sh1 not found"))?;
+    Ok(sh1["window_title"].clone())
+}
+
+/// Have sh1's shell print `printf_arg`, and wait for `shpool list --json` to
+/// report `want` as its window title.
+fn assert_window_title_reported(config: &str, printf_arg: &str, want: &str) -> anyhow::Result<()> {
+    let (mut daemon_proc, mut sess1) = attach_sh1(config)?;
+    assert!(
+        sh1_window_title(&mut daemon_proc)?.is_null(),
+        "expected no window title before one is set"
+    );
+
+    sess1.run_cmd(&format!("printf '{printf_arg}'"))?;
+    support::wait_until(|| Ok(sh1_window_title(&mut daemon_proc)? == want))
+        .with_context(|| format!("window title should be reported as {want:?}"))?;
+
+    Ok(())
+}
+
+#[test]
+#[timeout(30000)]
+fn json_window_title_vt100() -> anyhow::Result<()> {
+    assert_window_title_reported("restore_screen.toml", r"\033]2;hello\007", "hello")
+}
+
+#[test]
+#[timeout(30000)]
+fn json_window_title_vterm() -> anyhow::Result<()> {
+    assert_window_title_reported("vterm_screen.toml", r"\033]2;hello\007", "hello")
+}
+
+#[test]
+#[timeout(30000)]
+fn json_window_title_invalid_utf8_replaced() -> anyhow::Result<()> {
+    // vterm keeps a window title that is not UTF-8, where vt100 ignores it, so this
+    // shows the replacement.
+    assert_window_title_reported("vterm_screen.toml", r"\033]2;caf\351\007", "caf\u{fffd}")
+}
+
+#[test]
+#[timeout(30000)]
+fn json_window_title_null_in_simple_restore_mode() -> anyhow::Result<()> {
+    let (mut daemon_proc, mut sess1) = attach_sh1("norc.toml")?;
+    let mut lm1 = sess1.line_matcher()?;
+
+    sess1.run_cmd(r"printf '\033]2;hello\007'; echo done")?;
+    // The daemon handles output in order, so once `done` arrives it has also seen
+    // the window title.
+    lm1.scan_until_re("done$")?;
+    assert!(
+        sh1_window_title(&mut daemon_proc)?.is_null(),
+        "simple restore mode keeps no window title"
+    );
+
+    Ok(())
+}

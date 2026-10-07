@@ -106,11 +106,33 @@ pub struct SessionLifecycleState {
     pub attachment: Option<Attachment>,
 }
 
+/// A session's current window title. Written by the shell->client thread
+/// whenever the window title changes, and read by `handle_list`. Kept out of
+/// `inner` for the same reason as [`SessionLifecycleState::attachment`].
+#[derive(Debug, Default)]
+pub struct SessionWindowTitle {
+    window_title: Mutex<Option<String>>,
+}
+
+impl SessionWindowTitle {
+    /// Record a new window title, replacing any non-UTF-8 bytes with U+FFFD.
+    pub fn set(&self, window_title: Option<&[u8]>) {
+        *self.window_title.lock() =
+            window_title.map(|window_title| String::from_utf8_lossy(window_title).into_owned());
+    }
+
+    /// Return a copy of the current window title.
+    pub fn get(&self) -> Option<String> {
+        self.window_title.lock().clone()
+    }
+}
+
 /// Session represent a shell session
 #[derive(Debug)]
 pub struct Session {
     pub started_at: time::SystemTime,
     pub lifecycle: SessionLifecycle,
+    pub window_title: Arc<SessionWindowTitle>,
     pub child_pid: libc::pid_t,
     pub child_exit_notifier: Arc<ExitNotifier>,
     pub shell_to_client_ctl: Arc<Mutex<ShellToClientCtl>>,
@@ -260,6 +282,7 @@ pub struct ShellToClientArgs {
     // true if the client is still live, false if it has hung up on us.
     pub heartbeat_ack: crossbeam_channel::Sender<(u64, bool)>,
     pub child_exit_notifier: Arc<ExitNotifier>,
+    pub window_title: Arc<SessionWindowTitle>,
 }
 
 impl SessionInner {
@@ -291,6 +314,9 @@ impl SessionInner {
 
             let mut output_spool =
                 session_restore::new(config, &args.tty_size, args.scrollback_lines, &name);
+            // The raw bytes last written to `args.window_title`, cached locally so checking
+            // for changes doesn't lock `args.window_title`.
+            let mut last_window_title: Option<Vec<u8>> = None;
             let mut buf: Vec<u8> = vec![0; consts::BUF_SIZE];
             let mut poll_fds = [poll::PollFd::new(
                 watchable_master.borrow_fd(),
@@ -601,6 +627,11 @@ impl SessionInner {
 
                 if has_seen_prompt_sentinel {
                     output_spool.process(buf);
+                    let window_title = output_spool.window_title();
+                    if window_title != last_window_title.as_deref() {
+                        args.window_title.set(window_title);
+                        last_window_title = window_title.map(<[u8]>::to_vec);
+                    }
                 }
 
                 let mut reset_client_conn = false;
